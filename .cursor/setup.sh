@@ -12,9 +12,14 @@
 # It is safe to run repeatedly and terminates once the compiler is ready.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The Hexagon-MLIR repository is always checked out at /workspace in a Cloud
+# Agent. This script is intentionally location-independent: an identical copy is
+# baked into the snapshot at $BASE_DIR so install/start can run it regardless of
+# which branch is checked out (the committed copy under .cursor/ mirrors it).
+REPO_DIR="${HEXAGON_MLIR_ROOT:-/workspace}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "$REPO_DIR/.cursor/hexagon_env.sh"
+source "$SCRIPT_DIR/hexagon_env.sh"
 
 echo "==> Hexagon-MLIR setup starting (BASE_DIR=$BASE_DIR)"
 
