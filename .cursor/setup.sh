@@ -67,4 +67,4 @@ else
 fi
 
 echo "==> Setup complete. Compiler tool: $(command -v linalg-hexagon-opt || echo "$BACKEND_BIN")"
-echo "==> To work in a shell, run:  source $REPO_DIR/.cursor/hexagon_env.sh"
+echo "==> To work in a shell, run:  source $SCRIPT_DIR/hexagon_env.sh"
