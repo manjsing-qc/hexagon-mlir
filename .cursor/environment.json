@@ -1,6 +1,0 @@
-{
-  "name": "Hexagon-MLIR",
-  "user": "ubuntu",
-  "install": "bash /workspace/.cursor/setup.sh",
-  "start": "bash /workspace/.cursor/setup.sh"
-}
