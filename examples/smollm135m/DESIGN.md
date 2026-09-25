@@ -21,13 +21,78 @@ The file used here is `onnx-community/SmolLM-135M-ONNX`, path `onnx/model_fp16.o
 
 That ONNX graph is a **one-token decode** export: `input_ids` plus `past_key_values.{0..29}.{key,value}` and an attention mask whose length is `past + 1`. It is not a graph this compiler can ingest. hexagon-mlir lowers Triton (and Torch-MLIR) to Linalg, then to Hexagon LLVM. There is no ONNX dialect in the pipeline.
 
-So the pipeline is:
+The ONNX file is a weight source. Generation is a host loop over static-shape Triton kernels. Numeric checks on a real Hexagon DSP are deferred; the instruction simulator is too slow for the vocabulary matmul.
 
-1. Read fp16 initializers out of the ONNX file.
-2. Run a static-shape causal **prefill** whose math matches those weights.
-3. Lower every math op as a Triton kernel through the existing Hexagon backend.
+## Pipeline
 
-Host code owns the parts the compiler does not express well: the layer loop, the embedding gather (`[49152, 576]` table, indirect load), and the grouped-query repeat that expands 3 KV heads to 9.
+`generate.py` reads the fp16 ONNX file and a prompt, then greedy-decodes inside a fixed power-of-two context.
+
+```mermaid
+flowchart LR
+  onnx["fp16 ONNX"] --> weights["Initializer loader"]
+  prompt["Prompt"] --> tok["Tokenizer"]
+  tok --> ids["Token ids"]
+  weights --> sched["Host schedule"]
+  ids --> sched
+  sched --> kern["Triton kernels"]
+  kern --> mlir["hexagon-mlir"]
+  mlir --> dsp["Hexagon v75"]
+  sched --> text["Completion"]
+```
+
+One forward fills a length-`seq` buffer. Positions after the prompt stay at the end-of-text id. Causal attention keeps them from affecting the prefix. The new token is the argmax at the last filled position, then it is written into the next slot and the forward runs again.
+
+```mermaid
+flowchart TD
+  ids["Token buffer"] --> gather["Embedding gather on the host"]
+  gather --> layers["Decoder layer, repeated 30 times"]
+  layers --> fnorm["Final RMSNorm"]
+  fnorm --> head["LM head at the last filled row"]
+  head --> pick["Argmax"]
+  pick --> append["Append token, or stop"]
+  append --> ids
+```
+
+Each decoder layer is the Llama block. Grouped-query repeat is host-side: 3 key/value heads become 9. Everything else is a kernel.
+
+```mermaid
+flowchart TD
+  h["Hidden state, seq by 576"] --> rms1["RMSNorm"]
+  rms1 --> q["Q, 576"]
+  rms1 --> k["K, 192"]
+  rms1 --> v["V, 192"]
+  q --> ropeq["RoPE"]
+  k --> ropek["RoPE"]
+  ropek --> repeat["Repeat KV heads"]
+  v --> repeat
+  ropeq --> attn["Causal FlashAttention-2, 9 heads, dim 64"]
+  repeat --> attn
+  attn --> o["O, 576"]
+  o --> res1["Residual"]
+  h --> res1
+  res1 --> rms2["RMSNorm"]
+  rms2 --> gate["Gate, 1536"]
+  rms2 --> up["Up, 1536"]
+  gate --> swiglu["SwiGLU"]
+  up --> swiglu
+  swiglu --> down["Down, 576"]
+  down --> res2["Residual"]
+  res1 --> res2
+```
+
+Every kernel takes the same lowering path. The host launches one shared object per kernel.
+
+```mermaid
+flowchart LR
+  src["Triton"] --> ttir["Triton IR"]
+  ttir --> linalg["Linalg via triton-shared"]
+  linalg --> llvm["Hexagon LLVM dialect"]
+  llvm --> obj["Object file"]
+  obj --> so["hexagon-clang++ shared library"]
+  so --> run["hexagon-sim or the device"]
+```
+
+Host code owns the layer loop, the embedding gather from the `[49152, 576]` table, and the grouped-query repeat. The compiler sees only the static kernels.
 
 ## Kernels
 
@@ -37,7 +102,8 @@ All compute is fp16 in, fp32 accumulate where a reduction or matmul needs it, fp
 |---|---|---|
 | residual add | `residual_kernel` | flat vector add |
 | RMSNorm | `rms_norm_kernel` | variance in fp32 |
-| linear | `linear_tile_kernel` | `y = x @ W`, `W` is ONNX `[K, N]`. K is reduced in steps of 64. N is split into power-of-two column tiles (512, 256, 128, 64, …) because 192 / 576 / 1536 are not powers of two |
+| linear | `linear_tile_kernel` | projections. `y = x @ W` with ONNX layout `[K, N]`. K steps by 64. N is split into power-of-two column tiles |
+| LM head | `linear_kernel` | one launch for the last row, `[1, 576] @ [576, 49152]`, tiles of 512 inside the kernel |
 | RoPE | `rope_kernel` | Llama half-rotation, cos/sin table built on the host |
 | SwiGLU | `swiglu_kernel` | `silu(gate) * up` |
 | attention | `causal_attention_kernel` | causal FlashAttention-2 forward: online softmax, fp32 row max/sum, fp16 `tl.dot` |
@@ -47,9 +113,9 @@ Attention is launched once per head. The existing Hexagon flash-attention test i
 ## What this does not do
 
 - It does not compile the ONNX graph itself.
-- It does not grow a KV cache. Dynamic sequence length is unsupported in this Triton backend, so decode would be a separate static kernel per step.
-- It does not run all 30 layers on the simulator as the default check. Each kernel launch is a compile plus a `hexagon-sim` process. A full forward is a long series of those launches. The layer schedule is written so a prefix of layers can be selected.
-- The tied LM head (`[seq, 576] @ [576, 49152]`) is implemented with the same linear kernel and is off by default on the simulator because of the output width.
+- It does not grow a KV cache. Dynamic sequence length is unsupported, so each decode step replays a fixed-length causal prefill and writes the new token into the next position.
+- A full 30-layer simulator prefill is a long series of compile-and-sim launches. `--num-layers` selects a prefix of the stack. The default generation path runs all 30.
+- The tied LM head is one matmul launch, `[1, 576] @ [576, 49152]`, taken at the last filled position. On the instruction simulator that launch dominates wall time, so token-level timing is left for a device run.
 - int4 / bnb ONNX variants are out of scope. The source checkpoint is bfloat16; this path casts the published fp16 export.
 
 ## Files
@@ -58,7 +124,8 @@ Attention is launched once per head. The existing Hexagon flash-attention test i
 - `onnx_weights.py` — map ONNX initializers, including unnamed MatMul weights, into layer tensors
 - `reference.py` — PyTorch prefill used as the numeric reference
 - `kernels.py` — Triton kernels and launch helpers
-- `pipeline.py` — layer schedule on top of the kernels
+- `pipeline.py` — layer schedule and greedy decode loop
+- `generate.py` — command-line entry point: ONNX file in, generated text out
 - `fetch_model.py` — download `model_fp16.onnx`
 - `test_reference.py` — weight shapes, and a 1-token compare against ONNX Runtime
 - `test_kernels.py` — hexagon-sim checks
@@ -89,6 +156,16 @@ python test_kernels.py layer
 
 `layer` runs one full decoder block at sequence length 16 and the real hidden size, on random fp16 weights, and compares it to `reference.py`.
 
+Generate from the ONNX file:
+
+```bash
+python generate.py \
+    --onnx "$SMOLLM_ONNX" \
+    --prompt "The capital of France is" \
+    --max-new-tokens 8 \
+    --seq-len 16
+```
+
 ## What was run
 
 On hexagon-sim v75, fp16, against the PyTorch reference:
@@ -104,3 +181,5 @@ On hexagon-sim v75, fp16, against the PyTorch reference:
 | one full decoder layer, SmolLM widths, seq 16 | 0.00012 |
 
 The fp16 ONNX checkpoint itself was checked on CPU: a one-token prefill through all 30 layers matches ONNX Runtime on the published decode graph (empty KV cache). The top token agrees, and the max logit difference is 0.16. That graph is a decode export, so the length-1 prefill is the case where the two schedules are the same math.
+
+`generate.py` was started on hexagon-sim for the prompt "The capital of France is" at sequence length 16. It compiled and ran the embedding plus the first decoder layer, then entered the vocabulary matmul. That launch was stopped. Measuring tokens per second belongs on a device, where the same shared objects run on the DSP instead of being interpreted.

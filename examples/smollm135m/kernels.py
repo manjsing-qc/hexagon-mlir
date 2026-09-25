@@ -187,6 +187,34 @@ def rope_kernel(
 
 
 @triton.jit
+def linear_kernel(
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Full ``y = x @ w`` in one launch.
+
+    Column tiles stay inside the kernel so a wide matmul, including the tied
+    LM head, does not pay a simulator boot per tile. ``BLOCK_N`` must divide N.
+    """
+    offs_m = tl.arange(0, M)[:, None]
+    offs_bn = tl.arange(0, BLOCK_N)[None, :]
+    for n0 in range(0, N, BLOCK_N):
+        acc = tl.zeros((M, BLOCK_N), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            x = tl.load(x_ptr + offs_m * K + offs_k[None, :])
+            w = tl.load(w_ptr + offs_k[:, None] * N + (n0 + offs_bn))
+            acc = tl.dot(x, w, acc)
+        tl.store(y_ptr + offs_m * N + (n0 + offs_bn), acc.to(tl.float16))
+
+
+@triton.jit
 def linear_tile_kernel(
     x_ptr,
     w_ptr,
@@ -380,6 +408,46 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         DIM=dim,
         HALF=dim // 2,
         **_ELEMENTWISE,
+    )
+    return out
+
+
+def _dividing_block(n: int) -> int:
+    for block in (512, 256, 128, 64, 32, 16):
+        if n % block == 0:
+            return block
+    raise ValueError(f"N={n} cannot be covered by a power-of-two block that divides it")
+
+
+def matmul(x: torch.Tensor, weight: torch.Tensor, block_k: int = 64) -> torch.Tensor:
+    """``x @ weight`` in a single Hexagon launch.
+
+    ``x`` is ``[M, K]`` and ``weight`` is ``[K, N]``, both contiguous fp16.
+    M must be a power of two (1 is allowed). N must be divisible by a
+    power-of-two column tile.
+    """
+    activate()
+    _check_fp16(x, weight)
+    m, k = x.shape
+    k_w, n = weight.shape
+    if k != k_w:
+        raise ValueError(f"linear inner dim {k} != {k_w}")
+    if m <= 0 or triton.next_power_of_2(m) != m:
+        raise ValueError(f"M={m} must be a positive power of two")
+    if k % block_k:
+        raise ValueError(f"K={k} must be divisible by BLOCK_K={block_k}")
+    block_n = _dividing_block(n)
+    out = torch.empty((m, n), dtype=torch.float16)
+    linear_kernel[(1,)](
+        x,
+        weight,
+        out,
+        M=m,
+        K=k,
+        N=n,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        **_MATMUL,
     )
     return out
 
